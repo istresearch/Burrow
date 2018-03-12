@@ -1,17 +1,21 @@
-FROM golang:alpine
+FROM golang:1.9-alpine as builder
 
+ENV DEP_VERSION="0.3.2"
+RUN apk add --no-cache git curl && \
+	curl -L -s https://github.com/golang/dep/releases/download/v${DEP_VERSION}/dep-linux-amd64 -o $GOPATH/bin/dep && \
+	chmod +x $GOPATH/bin/dep && \
+	mkdir -p $GOPATH/src/github.com/linkedin/Burrow
+
+ADD . $GOPATH/src/github.com/linkedin/Burrow/
+RUN cd $GOPATH/src/github.com/linkedin/Burrow && \
+	dep ensure && \
+	go build -o /tmp/burrow .
+
+FROM iron/go
 MAINTAINER LinkedIn Burrow "https://github.com/linkedin/Burrow"
 
-RUN apk add --update bash curl git && apk add ca-certificates wget && update-ca-certificates && rm -rf /var/cache/apk/*
+WORKDIR /app
+COPY --from=builder /tmp/burrow /app/
+ADD /docker-config/burrow.toml /etc/burrow/
 
-RUN curl -sSO https://raw.githubusercontent.com/pote/gpm/v1.4.0/bin/gpm && \
-  chmod +x gpm && mv gpm /usr/local/bin
-
-ADD . $GOPATH/src/github.com/linkedin/Burrow
-RUN cd $GOPATH/src/github.com/linkedin/Burrow && gpm install && go install && mv $GOPATH/bin/Burrow $GOPATH/bin/burrow
-
-ADD docker-config /etc/burrow
-
-WORKDIR /var/tmp/burrow
-
-CMD ["/go/bin/burrow", "--config", "/etc/burrow/burrow.cfg"]
+CMD ["/app/burrow", "--config-dir", "/etc/burrow"]
