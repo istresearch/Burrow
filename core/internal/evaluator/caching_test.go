@@ -11,8 +11,10 @@
 package evaluator
 
 import (
-	"github.com/stretchr/testify/assert"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
 
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
@@ -198,11 +200,11 @@ var tests = []testset{
 	// 0 - returns OK because there is zero lag somewhere
 	{
 		offsets: []*protocol.ConsumerOffset{
-			{1000, 100000, 0},
-			{2000, 200000, 50},
-			{3000, 300000, 100},
-			{4000, 400000, 150},
-			{5000, 500000, 200},
+			{Offset: 1000, Order: 1, Timestamp: 100000, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 2000, Order: 2, Timestamp: 200000, Lag: &protocol.Lag{Value: 50}},
+			{Offset: 3000, Order: 3, Timestamp: 300000, Lag: &protocol.Lag{Value: 100}},
+			{Offset: 4000, Order: 4, Timestamp: 400000, Lag: &protocol.Lag{Value: 150}},
+			{Offset: 5000, Order: 5, Timestamp: 500000, Lag: &protocol.Lag{Value: 200}},
 		},
 		brokerOffsets:           []int64{5200},
 		currentLag:              200,
@@ -219,11 +221,11 @@ var tests = []testset{
 	// 1 - same status. does not return true for stop because time since last commit (400s) is equal to the difference (500-100), not greater than
 	{
 		offsets: []*protocol.ConsumerOffset{
-			{1000, 100000, 0},
-			{2000, 200000, 50},
-			{3000, 300000, 100},
-			{4000, 400000, 150},
-			{5000, 500000, 200},
+			{Offset: 1000, Order: 1, Timestamp: 100000, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 2000, Order: 2, Timestamp: 200000, Lag: &protocol.Lag{Value: 50}},
+			{Offset: 3000, Order: 3, Timestamp: 300000, Lag: &protocol.Lag{Value: 100}},
+			{Offset: 4000, Order: 4, Timestamp: 400000, Lag: &protocol.Lag{Value: 150}},
+			{Offset: 5000, Order: 5, Timestamp: 500000, Lag: &protocol.Lag{Value: 200}},
 		},
 		brokerOffsets:           []int64{5200},
 		currentLag:              200,
@@ -240,11 +242,11 @@ var tests = []testset{
 	// 2 - status is now STOP because the time since last commit is great enough (500s), even though lag is zero at the start (fixed due to #290)
 	{
 		offsets: []*protocol.ConsumerOffset{
-			{1000, 100000, 0},
-			{2000, 200000, 50},
-			{3000, 300000, 100},
-			{4000, 400000, 150},
-			{5000, 500000, 200},
+			{Offset: 1000, Order: 1, Timestamp: 100000, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 2000, Order: 2, Timestamp: 200000, Lag: &protocol.Lag{Value: 50}},
+			{Offset: 3000, Order: 3, Timestamp: 300000, Lag: &protocol.Lag{Value: 100}},
+			{Offset: 4000, Order: 4, Timestamp: 400000, Lag: &protocol.Lag{Value: 150}},
+			{Offset: 5000, Order: 5, Timestamp: 500000, Lag: &protocol.Lag{Value: 200}},
 		},
 		brokerOffsets:           []int64{5200},
 		currentLag:              200,
@@ -261,11 +263,11 @@ var tests = []testset{
 	// 3 - status is STOP when lag is always non-zero as well
 	{
 		offsets: []*protocol.ConsumerOffset{
-			{1000, 100000, 50},
-			{2000, 200000, 100},
-			{3000, 300000, 150},
-			{4000, 400000, 200},
-			{5000, 500000, 250},
+			{Offset: 1000, Order: 1, Timestamp: 100000, Lag: &protocol.Lag{Value: 50}},
+			{Offset: 2000, Order: 2, Timestamp: 200000, Lag: &protocol.Lag{Value: 100}},
+			{Offset: 3000, Order: 3, Timestamp: 300000, Lag: &protocol.Lag{Value: 150}},
+			{Offset: 4000, Order: 4, Timestamp: 400000, Lag: &protocol.Lag{Value: 200}},
+			{Offset: 5000, Order: 5, Timestamp: 500000, Lag: &protocol.Lag{Value: 250}},
 		},
 		brokerOffsets:           []int64{5250},
 		currentLag:              250,
@@ -282,11 +284,11 @@ var tests = []testset{
 	// 4 - status is OK because of zero lag, but stall is true because the offset is always the same and there is lag (another commit with turn this to stall)
 	{
 		offsets: []*protocol.ConsumerOffset{
-			{1000, 100000, 0},
-			{1000, 200000, 50},
-			{1000, 300000, 100},
-			{1000, 400000, 150},
-			{1000, 500000, 200},
+			{Offset: 1000, Order: 1, Timestamp: 100000, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 1000, Order: 2, Timestamp: 200000, Lag: &protocol.Lag{Value: 50}},
+			{Offset: 1000, Order: 3, Timestamp: 300000, Lag: &protocol.Lag{Value: 100}},
+			{Offset: 1000, Order: 4, Timestamp: 400000, Lag: &protocol.Lag{Value: 150}},
+			{Offset: 1000, Order: 5, Timestamp: 500000, Lag: &protocol.Lag{Value: 200}},
 		},
 		brokerOffsets:           []int64{1200},
 		currentLag:              200,
@@ -303,11 +305,11 @@ var tests = []testset{
 	// 5 - status is now STALL because the lag is always non-zero
 	{
 		offsets: []*protocol.ConsumerOffset{
-			{1000, 100000, 100},
-			{1000, 200000, 150},
-			{1000, 300000, 200},
-			{1000, 400000, 250},
-			{1000, 500000, 300},
+			{Offset: 1000, Order: 1, Timestamp: 100000, Lag: &protocol.Lag{Value: 100}},
+			{Offset: 1000, Order: 2, Timestamp: 200000, Lag: &protocol.Lag{Value: 150}},
+			{Offset: 1000, Order: 3, Timestamp: 300000, Lag: &protocol.Lag{Value: 200}},
+			{Offset: 1000, Order: 4, Timestamp: 400000, Lag: &protocol.Lag{Value: 250}},
+			{Offset: 1000, Order: 5, Timestamp: 500000, Lag: &protocol.Lag{Value: 300}},
 		},
 		brokerOffsets:           []int64{1300},
 		currentLag:              300,
@@ -324,11 +326,11 @@ var tests = []testset{
 	// 6 - status is still STALL even when the lag stays the same
 	{
 		offsets: []*protocol.ConsumerOffset{
-			{1000, 100000, 100},
-			{1000, 200000, 100},
-			{1000, 300000, 100},
-			{1000, 400000, 100},
-			{1000, 500000, 100},
+			{Offset: 1000, Order: 1, Timestamp: 100000, Lag: &protocol.Lag{Value: 100}},
+			{Offset: 1000, Order: 2, Timestamp: 200000, Lag: &protocol.Lag{Value: 100}},
+			{Offset: 1000, Order: 3, Timestamp: 300000, Lag: &protocol.Lag{Value: 100}},
+			{Offset: 1000, Order: 4, Timestamp: 400000, Lag: &protocol.Lag{Value: 100}},
+			{Offset: 1000, Order: 5, Timestamp: 500000, Lag: &protocol.Lag{Value: 100}},
 		},
 		brokerOffsets:           []int64{1100},
 		currentLag:              100,
@@ -345,11 +347,11 @@ var tests = []testset{
 	// 7 - status is REWIND because the offsets go backwards, even though the lag does decrease (rewind is worse)
 	{
 		offsets: []*protocol.ConsumerOffset{
-			{1000, 100000, 100},
-			{2000, 200000, 150},
-			{3000, 300000, 200},
-			{2000, 400000, 1250},
-			{4000, 500000, 300},
+			{Offset: 1000, Order: 1, Timestamp: 100000, Lag: &protocol.Lag{Value: 100}},
+			{Offset: 2000, Order: 2, Timestamp: 200000, Lag: &protocol.Lag{Value: 150}},
+			{Offset: 3000, Order: 3, Timestamp: 300000, Lag: &protocol.Lag{Value: 200}},
+			{Offset: 2000, Order: 4, Timestamp: 400000, Lag: &protocol.Lag{Value: 1250}},
+			{Offset: 4000, Order: 5, Timestamp: 500000, Lag: &protocol.Lag{Value: 300}},
 		},
 		brokerOffsets:           []int64{4300},
 		currentLag:              300,
@@ -366,11 +368,11 @@ var tests = []testset{
 	// 8 - status is OK because the current lag is 0 (even though the offsets show lag), even though it would be considered stopped due to timestamps
 	{
 		offsets: []*protocol.ConsumerOffset{
-			{1000, 100000, 50},
-			{2000, 200000, 100},
-			{3000, 300000, 150},
-			{4000, 400000, 200},
-			{5000, 500000, 250},
+			{Offset: 1000, Order: 1, Timestamp: 100000, Lag: &protocol.Lag{Value: 50}},
+			{Offset: 2000, Order: 2, Timestamp: 200000, Lag: &protocol.Lag{Value: 100}},
+			{Offset: 3000, Order: 3, Timestamp: 300000, Lag: &protocol.Lag{Value: 150}},
+			{Offset: 4000, Order: 4, Timestamp: 400000, Lag: &protocol.Lag{Value: 200}},
+			{Offset: 5000, Order: 5, Timestamp: 500000, Lag: &protocol.Lag{Value: 250}},
 		},
 		brokerOffsets:           []int64{5250},
 		currentLag:              0,
@@ -387,21 +389,21 @@ var tests = []testset{
 	// 9 - status is STOP due to timestamps because the current lag is non-zero, even though lag is always zero in offsets, only because there is new data (#290)
 	{
 		offsets: []*protocol.ConsumerOffset{
-			{792748079, 1512224618356, 0},
-			{792748080, 1512224619362, 0},
-			{792748081, 1512224620366, 0},
-			{792748082, 1512224621367, 0},
-			{792748083, 1512224622370, 0},
-			{792748084, 1512224623373, 0},
-			{792748085, 1512224624378, 0},
-			{792748086, 1512224625379, 0},
-			{792748087, 1512224626383, 0},
-			{792748088, 1512224627383, 0},
-			{792748089, 1512224628383, 0},
-			{792748090, 1512224629388, 0},
-			{792748091, 1512224630391, 0},
-			{792748092, 1512224631394, 0},
-			{792748093, 1512224632397, 0},
+			{Offset: 792748079, Order: 1, Timestamp: 1512224618356, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748080, Order: 2, Timestamp: 1512224619362, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748081, Order: 3, Timestamp: 1512224620366, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748082, Order: 4, Timestamp: 1512224621367, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748083, Order: 5, Timestamp: 1512224622370, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748084, Order: 6, Timestamp: 1512224623373, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748085, Order: 7, Timestamp: 1512224624378, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748086, Order: 8, Timestamp: 1512224625379, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748087, Order: 9, Timestamp: 1512224626383, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748088, Order: 10, Timestamp: 1512224627383, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748089, Order: 11, Timestamp: 1512224628383, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748090, Order: 12, Timestamp: 1512224629388, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748091, Order: 13, Timestamp: 1512224630391, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748092, Order: 14, Timestamp: 1512224631394, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748093, Order: 15, Timestamp: 1512224632397, Lag: &protocol.Lag{Value: 0}},
 		},
 		brokerOffsets:           []int64{792749024, 792749000, 792748800, 792748600, 792748500},
 		currentLag:              931,
@@ -418,21 +420,21 @@ var tests = []testset{
 	// 10 - status is OK, even though it would be stop due to timestamps, as within the recent broker offset window the lag was zero (#303)
 	{
 		offsets: []*protocol.ConsumerOffset{
-			{792748079, 1512224618356, 0},
-			{792748080, 1512224619362, 0},
-			{792748081, 1512224620366, 0},
-			{792748082, 1512224621367, 0},
-			{792748083, 1512224622370, 0},
-			{792748084, 1512224623373, 0},
-			{792748085, 1512224624378, 0},
-			{792748086, 1512224625379, 0},
-			{792748087, 1512224626383, 0},
-			{792748088, 1512224627383, 0},
-			{792748089, 1512224628383, 0},
-			{792748090, 1512224629388, 0},
-			{792748091, 1512224630391, 0},
-			{792748092, 1512224631394, 0},
-			{792748093, 1512224632397, 0},
+			{Offset: 792748079, Order: 1, Timestamp: 1512224618356, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748080, Order: 2, Timestamp: 1512224619362, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748081, Order: 3, Timestamp: 1512224620366, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748082, Order: 4, Timestamp: 1512224621367, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748083, Order: 5, Timestamp: 1512224622370, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748084, Order: 6, Timestamp: 1512224623373, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748085, Order: 7, Timestamp: 1512224624378, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748086, Order: 8, Timestamp: 1512224625379, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748087, Order: 9, Timestamp: 1512224626383, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748088, Order: 10, Timestamp: 1512224627383, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748089, Order: 11, Timestamp: 1512224628383, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748090, Order: 12, Timestamp: 1512224629388, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748091, Order: 13, Timestamp: 1512224630391, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748092, Order: 14, Timestamp: 1512224631394, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 792748093, Order: 15, Timestamp: 1512224632397, Lag: &protocol.Lag{Value: 0}},
 		},
 		brokerOffsets:           []int64{792748094, 792748093, 792748093, 792748093},
 		currentLag:              1,
@@ -443,6 +445,32 @@ var tests = []testset{
 		checkIfOffsetsStalled:   false,
 		checkIfLagNotDecreasing: true,
 		checkIfRecentLagZero:    true,
+		status:                  protocol.StatusOK,
+	},
+
+	// 11 - same case as test 0 with additional `nil` lag entries which should not affect results
+	{
+		offsets: []*protocol.ConsumerOffset{
+			{Offset: 1000, Order: 10, Timestamp: 100000, Lag: &protocol.Lag{Value: 0}},
+			{Offset: 1500, Order: 15, Timestamp: 150000, Lag: nil},
+			{Offset: 2000, Order: 20, Timestamp: 200000, Lag: &protocol.Lag{Value: 50}},
+			{Offset: 2500, Order: 25, Timestamp: 250000, Lag: nil},
+			{Offset: 3000, Order: 30, Timestamp: 300000, Lag: &protocol.Lag{Value: 100}},
+			{Offset: 3500, Order: 35, Timestamp: 350000, Lag: nil},
+			{Offset: 4000, Order: 40, Timestamp: 400000, Lag: &protocol.Lag{Value: 150}},
+			{Offset: 4500, Order: 45, Timestamp: 450000, Lag: nil},
+			{Offset: 5000, Order: 50, Timestamp: 500000, Lag: &protocol.Lag{Value: 200}},
+			{Offset: 5500, Order: 55, Timestamp: 550000, Lag: nil},
+		},
+		brokerOffsets:           []int64{5700},
+		currentLag:              200,
+		timeNow:                 600,
+		isLagAlwaysNotZero:      false,
+		checkIfOffsetsRewind:    false,
+		checkIfOffsetsStopped:   false,
+		checkIfOffsetsStalled:   false,
+		checkIfLagNotDecreasing: true,
+		checkIfRecentLagZero:    false,
 		status:                  protocol.StatusOK,
 	},
 }
@@ -470,4 +498,37 @@ func TestCachingEvaluator_CheckRules(t *testing.T) {
 		status := calculatePartitionStatus(testSet.offsets, testSet.brokerOffsets, testSet.currentLag, testSet.timeNow)
 		assert.Equalf(t, testSet.status, status, "TEST %v: Expected calculatePartitionStatus to return %v, not %v", i, testSet.status.String(), status.String())
 	}
+}
+
+// TODO this test should fail, ie a group should not exist if all its topics are deleted.
+func TestCachingEvaluator_TopicDeleted(t *testing.T) {
+	storageCoordinator, module := fixtureModule()
+	module.Configure("test", "evaluator.test")
+	module.Start()
+
+	// Deleting a topic will not delete the consumer group even if the consumer group has no topics
+	storageCoordinator.App.StorageChannel <- &protocol.StorageRequest{
+		RequestType: protocol.StorageSetDeleteTopic,
+		Cluster:     "testcluster",
+		Topic:       "testtopic",
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	evalRequest := &protocol.EvaluatorRequest{
+		Reply:   make(chan *protocol.ConsumerGroupStatus),
+		Cluster: "testcluster",
+		Group:   "testgroup",
+		ShowAll: true,
+	}
+
+	module.GetCommunicationChannel() <- evalRequest
+	evalResponse := <-evalRequest.Reply
+
+	// The status is returned as 'OK' as the topic has previously existed and
+	// belonged to a group therefore if the group has a recent timestamp in the
+	// consumerMap the evaluator continues as normal but processes no
+	// partitions.
+	assert.Equalf(t, protocol.StatusOK, evalResponse.Status, "Expected status to be OK, not %v", evalResponse.Status.String())
+	assert.Emptyf(t, evalResponse.Partitions, "Expected no partitions to be returned")
+	assert.Equalf(t, float32(0.0), evalResponse.Complete, "Expected 'Complete' to be 0.0")
 }

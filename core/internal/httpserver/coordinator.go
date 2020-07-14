@@ -46,6 +46,8 @@ type Coordinator struct {
 
 	router  *httprouter.Router
 	servers map[string]*http.Server
+	theCert map[string]string
+	theKey  map[string]string
 }
 
 // Configure is called to configure the HTTP server. This includes validating all configurations for each configured
@@ -67,6 +69,8 @@ func (hc *Coordinator) Configure() {
 
 	// Validate provided HTTP server configs
 	hc.servers = make(map[string]*http.Server)
+	hc.theCert = make(map[string]string)
+	hc.theKey = make(map[string]string)
 	for name := range servers {
 		configRoot := "httpserver." + name
 		server := &http.Server{
@@ -84,11 +88,12 @@ func (hc *Coordinator) Configure() {
 		server.ReadHeaderTimeout = time.Duration(timeout) * time.Second
 		server.WriteTimeout = time.Duration(timeout) * time.Second
 		server.IdleTimeout = time.Duration(timeout) * time.Second
-
+		keyFile := ""
+		certFile := ""
 		if viper.IsSet(configRoot + ".tls") {
 			tlsName := viper.GetString(configRoot + ".tls")
-			certFile := viper.GetString("tls." + tlsName + ".certfile")
-			keyFile := viper.GetString("tls." + tlsName + ".keyfile")
+			certFile = viper.GetString("tls." + tlsName + ".certfile")
+			keyFile = viper.GetString("tls." + tlsName + ".keyfile")
 			caFile := viper.GetString("tls." + tlsName + ".cafile")
 
 			server.TLSConfig = &tls.Config{}
@@ -110,9 +115,10 @@ func (hc *Coordinator) Configure() {
 				panic("cannot read TLS certificate or key file: " + err.Error())
 			}
 			server.TLSConfig.Certificates = []tls.Certificate{cert}
-			server.TLSConfig.BuildNameToCertificate()
 		}
 		hc.servers[name] = server
+		hc.theCert[name] = certFile
+		hc.theKey[name] = keyFile
 	}
 
 	// Configure URL routes here
@@ -122,6 +128,8 @@ func (hc *Coordinator) Configure() {
 
 	// This is a healthcheck URL. Please don't change it
 	hc.router.GET("/burrow/admin", hc.handleAdmin)
+
+	hc.router.Handler(http.MethodGet, "/metrics", hc.handlePrometheusMetrics())
 
 	// All valid paths go here
 	hc.router.GET("/v3/kafka", hc.handleClusterList)
@@ -161,6 +169,7 @@ func (hc *Coordinator) Start() error {
 
 	// Start listeners
 	listeners := make(map[string]net.Listener)
+
 	for name, server := range hc.servers {
 		ln, err := net.Listen("tcp", hc.servers[name].Addr)
 		if err != nil {
@@ -184,7 +193,11 @@ func (hc *Coordinator) Start() error {
 
 	// Start the HTTP server on the listeners
 	for name, server := range hc.servers {
-		go server.Serve(listeners[name])
+		if hc.theCert[name] != "" || hc.theKey[name] != "" {
+			go server.ServeTLS(listeners[name], hc.theCert[name], hc.theKey[name])
+		} else {
+			go server.Serve(listeners[name])
+		}
 	}
 	return nil
 }
@@ -245,6 +258,8 @@ func (hc *Coordinator) writeResponse(w http.ResponseWriter, r *http.Request, sta
 	if corsHeader != "" {
 		w.Header().Set("Access-Control-Allow-Origin", corsHeader)
 	}
+
+	w.Header().Set("Content-Type", "application/json")
 
 	if jsonBytes, err := json.Marshal(jsonObj); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)

@@ -14,17 +14,20 @@ import (
 	"errors"
 	"time"
 
-	"github.com/stretchr/testify/assert"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 
 	"github.com/samuel/go-zookeeper/zk"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 
+	"sync"
+
+	"github.com/stretchr/testify/mock"
+
 	"github.com/linkedin/Burrow/core/internal/helpers"
 	"github.com/linkedin/Burrow/core/protocol"
-	"github.com/stretchr/testify/mock"
-	"sync"
 )
 
 func fixtureKafkaZkModule() *KafkaZkClient {
@@ -112,6 +115,7 @@ func TestKafkaZkClient_watchGroupList(t *testing.T) {
 	mockZookeeper.On("ExistsW", "/consumers/testgroup/offsets").Return(true, offsetStat, func() <-chan zk.Event { return topicExistsChan }(), nil)
 	mockZookeeper.On("ChildrenW", "/consumers/testgroup/offsets/testtopic").Return([]string{"0"}, offsetStat, func() <-chan zk.Event { return newPartitionChan }(), nil)
 	mockZookeeper.On("GetW", "/consumers/testgroup/offsets/testtopic/0").Return([]byte("81234"), offsetStat, func() <-chan zk.Event { return newOffsetChan }(), nil)
+	mockZookeeper.On("GetW", "/consumers/testgroup/owners/testtopic/0").Return([]byte("testowner"), offsetStat, func() <-chan zk.Event { return newOffsetChan }(), nil)
 
 	watchEventChan := make(chan zk.Event)
 
@@ -158,6 +162,10 @@ func TestKafkaZkClient_watchGroupList(t *testing.T) {
 			State: zk.StateConnected,
 			Path:  "/consumers/testgroup/offsets/testtopic/1/shouldntgetcalled",
 		}
+
+		secondRequest := <-module.App.StorageChannel
+		assert.Equalf(t, protocol.StorageSetConsumerOwner, secondRequest.RequestType, "Expected request sent with type StorageSetConsumerOwner, not %v", secondRequest.RequestType)
+		assert.Equalf(t, "testowner", secondRequest.Owner, "Expected request sent with Owner testowner, not %v", secondRequest.Owner)
 	}()
 
 	module.running.Add(1)
@@ -171,6 +179,7 @@ func TestKafkaZkClient_watchGroupList(t *testing.T) {
 func TestKafkaZkClient_resetOffsetWatchAndSend_BadPath(t *testing.T) {
 	mockZookeeper := helpers.MockZookeeperClient{}
 	mockZookeeper.On("GetW", "/consumers/testgroup/offsets/testtopic/0").Return([]byte("81234"), (*zk.Stat)(nil), (<-chan zk.Event)(nil), errors.New("badpath"))
+	mockZookeeper.On("GetW", "/consumers/testgroup/owners/testtopic/0").Return([]byte("testowner"), (*zk.Stat)(nil), (<-chan zk.Event)(nil), nil)
 
 	module := fixtureKafkaZkModule()
 	module.Configure("test", "consumer.test")
@@ -191,6 +200,7 @@ func TestKafkaZkClient_resetOffsetWatchAndSend_BadOffset(t *testing.T) {
 	offsetStat := &zk.Stat{Mtime: 894859}
 	newWatchEventChan := make(chan zk.Event)
 	mockZookeeper.On("GetW", "/consumers/testgroup/offsets/testtopic/0").Return([]byte("notanumber"), offsetStat, func() <-chan zk.Event { return newWatchEventChan }(), nil)
+	mockZookeeper.On("GetW", "/consumers/testgroup/owners/testtopic/0").Return([]byte("testowner"), (*zk.Stat)(nil), (<-chan zk.Event)(nil), nil)
 
 	// This will block if a storage request is sent, as nothing is watching that channel
 	module.running.Add(1)

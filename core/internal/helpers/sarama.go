@@ -15,38 +15,56 @@ import (
 	"crypto/x509"
 	"io/ioutil"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
 	"github.com/Shopify/sarama"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/mock"
 )
 
+var kafkaVersions = map[string]sarama.KafkaVersion{
+	"":         sarama.V0_10_2_0,
+	"0.8.0":    sarama.V0_8_2_0,
+	"0.8.1":    sarama.V0_8_2_1,
+	"0.8.2":    sarama.V0_8_2_2,
+	"0.8":      sarama.V0_8_2_0,
+	"0.9.0.0":  sarama.V0_9_0_0,
+	"0.9.0.1":  sarama.V0_9_0_1,
+	"0.9.0":    sarama.V0_9_0_0,
+	"0.9":      sarama.V0_9_0_0,
+	"0.10.0.0": sarama.V0_10_0_0,
+	"0.10.0.1": sarama.V0_10_0_1,
+	"0.10.0":   sarama.V0_10_0_0,
+	"0.10.1.0": sarama.V0_10_1_0,
+	"0.10.1":   sarama.V0_10_1_0,
+	"0.10.2.0": sarama.V0_10_2_0,
+	"0.10.2.1": sarama.V0_10_2_0,
+	"0.10.2":   sarama.V0_10_2_0,
+	"0.10":     sarama.V0_10_0_0,
+	"0.11.0.1": sarama.V0_11_0_0,
+	"0.11.0.2": sarama.V0_11_0_0,
+	"0.11.0":   sarama.V0_11_0_0,
+	"1.0.0":    sarama.V1_0_0_0,
+	"1.1.0":    sarama.V1_1_0_0,
+	"1.1.1":    sarama.V1_1_0_0,
+	"2.0.0":    sarama.V2_0_0_0,
+	"2.0.1":    sarama.V2_0_0_0,
+	"2.1.0":    sarama.V2_1_0_0,
+	"2.2.0":    sarama.V2_2_0_0,
+	"2.2.1":    sarama.V2_2_0_0,
+	"2.3.0":    sarama.V2_3_0_0,
+	"2.4.0":    sarama.V2_4_0_0,
+	"2.5.0":    sarama.V2_5_0_0,
+}
+
 func parseKafkaVersion(kafkaVersion string) sarama.KafkaVersion {
-	switch kafkaVersion {
-	case "0.8", "0.8.0":
-		return sarama.V0_8_2_0
-	case "0.8.1":
-		return sarama.V0_8_2_1
-	case "0.8.2":
-		return sarama.V0_8_2_2
-	case "0.9", "0.9.0", "0.9.0.0":
-		return sarama.V0_9_0_0
-	case "0.9.0.1":
-		return sarama.V0_9_0_1
-	case "0.10", "0.10.0", "0.10.0.0":
-		return sarama.V0_10_0_0
-	case "0.10.0.1":
-		return sarama.V0_10_0_1
-	case "0.10.1", "0.10.1.0":
-		return sarama.V0_10_1_0
-	case "", "0.10.2", "0.10.2.0", "0.10.2.1":
-		return sarama.V0_10_2_0
-	case "0.11.0", "0.11.0.1", "0.11.0.2":
-		return sarama.V0_11_0_0
-	case "1.0.0":
-		return sarama.V1_0_0_0
-	default:
+	version, ok := kafkaVersions[kafkaVersion]
+	if !ok {
 		panic("Unknown Kafka Version: " + kafkaVersion)
 	}
+
+	return version
 }
 
 // GetSaramaConfigFromClientProfile takes the name of a client-profile configuration entry and returns a sarama.Config
@@ -66,6 +84,7 @@ func GetSaramaConfigFromClientProfile(profileName string) *sarama.Config {
 	saramaConfig := sarama.NewConfig()
 	saramaConfig.ClientID = viper.GetString(configRoot + ".client-id")
 	saramaConfig.Version = parseKafkaVersion(viper.GetString(configRoot + ".kafka-version"))
+	saramaConfig.Consumer.Return.Errors = true
 
 	// Configure TLS if enabled
 	if viper.IsSet(configRoot + ".tls") {
@@ -76,24 +95,26 @@ func GetSaramaConfigFromClientProfile(profileName string) *sarama.Config {
 		keyFile := viper.GetString("tls." + tlsName + ".keyfile")
 		caFile := viper.GetString("tls." + tlsName + ".cafile")
 
-		if certFile == "" || keyFile == "" || caFile == "" {
+		if caFile == "" {
 			saramaConfig.Net.TLS.Config = &tls.Config{}
 		} else {
 			caCert, err := ioutil.ReadFile(caFile)
 			if err != nil {
 				panic("cannot read TLS CA file: " + err.Error())
 			}
-			cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-			if err != nil {
-				panic("cannot read TLS certificate or key file: " + err.Error())
-			}
 			caCertPool := x509.NewCertPool()
 			caCertPool.AppendCertsFromPEM(caCert)
 			saramaConfig.Net.TLS.Config = &tls.Config{
-				Certificates: []tls.Certificate{cert},
-				RootCAs:      caCertPool,
+				RootCAs: caCertPool,
 			}
-			saramaConfig.Net.TLS.Config.BuildNameToCertificate()
+
+			if certFile != "" && keyFile != "" {
+				cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+				if err != nil {
+					panic("cannot read TLS certificate or key file: " + err.Error())
+				}
+				saramaConfig.Net.TLS.Config.Certificates = []tls.Certificate{cert}
+			}
 		}
 		saramaConfig.Net.TLS.Config.InsecureSkipVerify = viper.GetBool("tls." + tlsName + ".noverify")
 	}
@@ -103,6 +124,18 @@ func GetSaramaConfigFromClientProfile(profileName string) *sarama.Config {
 		saslName := viper.GetString(configRoot + ".sasl")
 
 		saramaConfig.Net.SASL.Enable = true
+		mechanism := viper.GetString("sasl." + saslName + ".mechanism")
+		if mechanism == "SCRAM-SHA-256" {
+			saramaConfig.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA256
+			saramaConfig.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+				return &XDGSCRAMClient{HashGeneratorFcn: SHA256}
+			}
+		} else if mechanism == "SCRAM-SHA-512" {
+			saramaConfig.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
+			saramaConfig.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+				return &XDGSCRAMClient{HashGeneratorFcn: SHA512}
+			}
+		}
 		saramaConfig.Net.SASL.Handshake = viper.GetBool("sasl." + saslName + ".handshake-first")
 		saramaConfig.Net.SASL.User = viper.GetString("sasl." + saslName + ".username")
 		saramaConfig.Net.SASL.Password = viper.GetString("sasl." + saslName + ".password")
@@ -509,4 +542,15 @@ func (m *MockSaramaPartitionConsumer) Errors() <-chan *sarama.ConsumerError {
 func (m *MockSaramaPartitionConsumer) HighWaterMarkOffset() int64 {
 	args := m.Called()
 	return args.Get(0).(int64)
+}
+
+func newSaramaZapLogger(logger *zap.Logger) sarama.StdLogger {
+	sl, _ := zap.NewStdLogAt(logger.With(zap.String("name", "sarama")), zapcore.DebugLevel)
+	return sl
+}
+
+// InitSaramaLogging assigns a new logger to sarama.Logger, which
+// will send messages to given zap logger at debug level
+func InitSaramaLogging(logger *zap.Logger) {
+	sarama.Logger = newSaramaZapLogger(logger)
 }

@@ -1,8 +1,7 @@
-FROM iron/go
-MAINTAINER LinkedIn Burrow "https://github.com/linkedin/Burrow"
+FROM alpine:3.11
+LABEL maintainer="LinkedIn Burrow https://github.com/linkedin/Burrow"
 
 WORKDIR /app
-ADD burrow /app/
-ADD burrow.toml /etc/burrow/
+COPY burrow /app/
 
 CMD ["/app/burrow", "--config-dir", "/etc/burrow"]

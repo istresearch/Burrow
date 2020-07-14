@@ -23,6 +23,8 @@ import (
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 
+	"crypto/tls"
+
 	"github.com/linkedin/Burrow/core/protocol"
 )
 
@@ -56,8 +58,8 @@ type HTTPNotifier struct {
 // Configure validates the configuration of the http notifier. At minimum, there must be a url-open specified, and if
 // send-close is set to true there must also be a url-close. If these are missing or incorrect, this func will panic
 // with an explanatory message. It is also possible to configure a specific method (such as POST or DELETE) to be used
-// with these URLs, as well as a timeout and keepalive for the HTTP client.
-func (module *HTTPNotifier) Configure(name string, configRoot string) {
+// with these URLs, as well as a timeout and keepalive for the HTTP smtpClient.
+func (module *HTTPNotifier) Configure(name, configRoot string) {
 	module.name = name
 
 	// Validate and set defaults for profile configs
@@ -66,6 +68,7 @@ func (module *HTTPNotifier) Configure(name string, configRoot string) {
 		module.Log.Panic("no url-open specified")
 		panic(errors.New("configuration error"))
 	}
+
 	viper.SetDefault(configRoot+".method-open", "POST")
 	module.methodOpen = viper.GetString(configRoot + ".method-open")
 
@@ -84,15 +87,27 @@ func (module *HTTPNotifier) Configure(name string, configRoot string) {
 	viper.SetDefault(configRoot+".timeout", 5)
 	viper.SetDefault(configRoot+".keepalive", 300)
 
-	// Set up HTTP client
+	tlsConfig := buildHTTPTLSConfig(viper.GetString(configRoot+".extra-ca"), viper.GetBool(configRoot+".noverify"))
+
 	module.httpClient = &http.Client{
 		Timeout: viper.GetDuration(configRoot+".timeout") * time.Second,
 		Transport: &http.Transport{
 			Dial: (&net.Dialer{
 				KeepAlive: viper.GetDuration(configRoot+".keepalive") * time.Second,
 			}).Dial,
-			Proxy: http.ProxyFromEnvironment,
+			Proxy:             http.ProxyFromEnvironment,
+			TLSClientConfig:   tlsConfig,
+			DisableKeepAlives: viper.GetBool(configRoot + ".disable-http-keepalive"),
 		},
+	}
+}
+
+func buildHTTPTLSConfig(extraCaFile string, noVerify bool) *tls.Config {
+	rootCAs := buildRootCAs(extraCaFile, noVerify)
+
+	return &tls.Config{
+		InsecureSkipVerify: noVerify,
+		RootCAs:            rootCAs,
 	}
 }
 
@@ -162,8 +177,20 @@ func (module *HTTPNotifier) Notify(status *protocol.ConsumerGroupStatus, eventID
 		return
 	}
 
+	urlTmpl, err := template.New("url").Parse(url)
+	if err != nil {
+		logger.Error("failed to parse url", zap.Error(err))
+		return
+	}
+
+	urlToSend, err := executeTemplate(urlTmpl, module.extras, status, eventID, startTime)
+	if err != nil {
+		logger.Error("failed to assemble url", zap.Error(err))
+		return
+	}
+
 	// Send request to HTTP endpoint
-	req, err := http.NewRequest(method, url, bytesToSend)
+	req, err := http.NewRequest(method, urlToSend.String(), bytesToSend)
 	if err != nil {
 		logger.Error("failed to create request", zap.Error(err))
 		return
@@ -174,6 +201,10 @@ func (module *HTTPNotifier) Notify(status *protocol.ConsumerGroupStatus, eventID
 		req.SetBasicAuth(viper.GetString("notifier."+module.name+".username"), viper.GetString("notifier."+module.name+".password"))
 	}
 	req.Header.Set("Content-Type", "application/json")
+
+	for header, value := range viper.GetStringMapString("notifier." + module.name + ".headers") {
+		req.Header.Set(header, value)
+	}
 
 	resp, err := module.httpClient.Do(req)
 	if err != nil {

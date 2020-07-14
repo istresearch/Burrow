@@ -14,15 +14,16 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"regexp"
 	"sync"
+	"time"
 
 	"github.com/Shopify/sarama"
+	"github.com/spf13/viper"
 	"go.uber.org/zap"
 
 	"github.com/linkedin/Burrow/core/internal/helpers"
 	"github.com/linkedin/Burrow/core/protocol"
-	"github.com/spf13/viper"
-	"regexp"
 )
 
 // KafkaClient is a consumer module which connects to a single Apache Kafka cluster and reads consumer group information
@@ -36,14 +37,16 @@ type KafkaClient struct {
 	// fields that are appropriate to identify this coordinator
 	Log *zap.Logger
 
-	name           string
-	cluster        string
-	servers        []string
-	offsetsTopic   string
-	startLatest    bool
-	saramaConfig   *sarama.Config
-	groupWhitelist *regexp.Regexp
-	groupBlacklist *regexp.Regexp
+	name                  string
+	cluster               string
+	servers               []string
+	offsetsTopic          string
+	startLatest           bool
+	backfillEarliest      bool
+	reportedConsumerGroup string
+	saramaConfig          *sarama.Config
+	groupWhitelist        *regexp.Regexp
+	groupBlacklist        *regexp.Regexp
 
 	quitChannel chan struct{}
 	running     sync.WaitGroup
@@ -61,25 +64,30 @@ type offsetValue struct {
 	ErrorAt   string
 }
 type metadataHeader struct {
-	ProtocolType string
-	Generation   int32
-	Protocol     string
-	Leader       string
+	ProtocolType          string
+	Generation            int32
+	Protocol              string
+	Leader                string
+	CurrentStateTimestamp int64
 }
 type metadataMember struct {
 	MemberID         string
+	GroupInstanceID  string
 	ClientID         string
 	ClientHost       string
 	RebalanceTimeout int32
 	SessionTimeout   int32
 	Assignment       map[string][]int32
 }
+type backfillEndOffset struct {
+	Value int64
+}
 
 // Configure validates the configuration for the consumer. At minimum, there must be a cluster name to which these
 // consumers belong, as well as a list of servers provided for the Kafka cluster, of the form host:port. If not
 // explicitly configured, the offsets topic is set to the default for Kafka, which is __consumer_offsets. If the
 // cluster name is unknown, or if the server list is missing or invalid, this func will panic.
-func (module *KafkaClient) Configure(name string, configRoot string) {
+func (module *KafkaClient) Configure(name, configRoot string) {
 	module.Log.Info("configuring")
 
 	module.name = name
@@ -105,6 +113,8 @@ func (module *KafkaClient) Configure(name string, configRoot string) {
 	viper.SetDefault(configRoot+".offsets-topic", "__consumer_offsets")
 	module.offsetsTopic = viper.GetString(configRoot + ".offsets-topic")
 	module.startLatest = viper.GetBool(configRoot + ".start-latest")
+	module.backfillEarliest = module.startLatest && viper.GetBool(configRoot+".backfill-earliest")
+	module.reportedConsumerGroup = "burrow-" + module.name
 
 	whitelist := viper.GetString(configRoot + ".group-whitelist")
 	if whitelist != "" {
@@ -160,13 +170,92 @@ func (module *KafkaClient) Stop() error {
 	return nil
 }
 
-func (module *KafkaClient) partitionConsumer(consumer sarama.PartitionConsumer) {
+func (module *KafkaClient) startBackfillPartitionConsumer(partition int32, client helpers.SaramaClient, consumer sarama.Consumer) error {
+	pconsumer, err := consumer.ConsumePartition(module.offsetsTopic, partition, sarama.OffsetOldest)
+	if err != nil {
+		module.Log.Error("failed to consume partition",
+			zap.String("topic", module.offsetsTopic),
+			zap.Int32("partition", partition),
+			zap.String("error", err.Error()),
+		)
+		return err
+	}
+
+	// We check for an empty partition after building the consumer, otherwise we
+	// could be unlucky enough to observe a nonempty partition
+	// whose only segment expires right after we check.
+	oldestOffset, err := client.GetOffset(module.offsetsTopic, partition, sarama.OffsetOldest)
+	if err != nil {
+		module.Log.Error("failed to get oldest offset",
+			zap.String("topic", module.offsetsTopic),
+			zap.Int32("partition", partition),
+			zap.String("error", err.Error()),
+		)
+		return err
+	}
+
+	newestOffset, err := client.GetOffset(module.offsetsTopic, partition, sarama.OffsetNewest)
+	if err != nil {
+		module.Log.Error("failed to get newest offset",
+			zap.String("topic", module.offsetsTopic),
+			zap.Int32("partition", partition),
+			zap.String("error", err.Error()),
+		)
+		return err
+	}
+	if newestOffset > 0 {
+		// GetOffset returns the next (not yet published) offset, but we want the latest published offset.
+		newestOffset--
+	}
+
+	if oldestOffset >= newestOffset {
+		module.Log.Info("not backfilling empty partition",
+			zap.String("topic", module.offsetsTopic),
+			zap.Int32("partition", partition),
+			zap.Int64("oldestOffset", oldestOffset),
+			zap.Int64("newestOffset", newestOffset),
+		)
+		pconsumer.AsyncClose()
+	} else {
+		module.running.Add(1)
+		endWaterMark := &backfillEndOffset{newestOffset}
+		module.Log.Debug("consuming backfill",
+			zap.Int32("partition", partition),
+			zap.Int64("oldestOffset", oldestOffset),
+			zap.Int64("newestOffset", newestOffset),
+		)
+		go module.partitionConsumer(pconsumer, endWaterMark)
+	}
+	return nil
+}
+
+func (module *KafkaClient) partitionConsumer(consumer sarama.PartitionConsumer, stopAtOffset *backfillEndOffset) {
 	defer module.running.Done()
 	defer consumer.AsyncClose()
 
 	for {
 		select {
 		case msg := <-consumer.Messages():
+			if module.reportedConsumerGroup != "" {
+				burrowOffset := &protocol.StorageRequest{
+					RequestType: protocol.StorageSetConsumerOffset,
+					Cluster:     module.cluster,
+					Topic:       msg.Topic,
+					Partition:   msg.Partition,
+					Group:       module.reportedConsumerGroup,
+					Timestamp:   time.Now().Unix() * 1000,
+					Offset:      msg.Offset + 1, // emulating a consumer which should commit (lastSeenOffset+1)
+					Order:       msg.Offset,
+				}
+				helpers.TimeoutSendStorageRequest(module.App.StorageChannel, burrowOffset, 1)
+			}
+			if stopAtOffset != nil && msg.Offset >= stopAtOffset.Value {
+				module.Log.Debug("backfill consumer reached target offset, terminating",
+					zap.Int32("partition", msg.Partition),
+					zap.Int64("offset", stopAtOffset.Value),
+				)
+				return
+			}
 			module.processConsumerOffsetsMessage(msg)
 		case err := <-consumer.Errors():
 			module.Log.Error("consume error",
@@ -211,18 +300,49 @@ func (module *KafkaClient) startKafkaConsumer(client helpers.SaramaClient) error
 		zap.String("topic", module.offsetsTopic),
 		zap.Int("count", len(partitions)),
 	)
-	for i, partition := range partitions {
+	for _, partition := range partitions {
 		pconsumer, err := consumer.ConsumePartition(module.offsetsTopic, partition, startFrom)
 		if err != nil {
 			module.Log.Error("failed to consume partition",
 				zap.String("topic", module.offsetsTopic),
-				zap.Int("partition", i),
+				zap.Int32("partition", partition),
 				zap.String("error", err.Error()),
 			)
 			return err
 		}
 		module.running.Add(1)
-		go module.partitionConsumer(pconsumer)
+		go module.partitionConsumer(pconsumer, nil)
+	}
+
+	if module.backfillEarliest {
+		module.Log.Debug("backfilling consumer offsets")
+		// Note: since we are consuming each partition twice,
+		// we need a second consumer instance
+		consumer, err := client.NewConsumerFromClient()
+		if err != nil {
+			module.Log.Error("failed to get new consumer", zap.Error(err))
+			client.Close()
+			return err
+		}
+
+		waiting := len(partitions)
+		backfillStartedChan := make(chan error)
+		for _, partition := range partitions {
+			go func(partition int32) {
+				backfillStartedChan <- module.startBackfillPartitionConsumer(partition, client, consumer)
+			}(partition)
+		}
+		for waiting > 0 {
+			select {
+			case err := <-backfillStartedChan:
+				waiting--
+				if err != nil {
+					return err
+				}
+			case <-module.quitChannel:
+				return nil
+			}
+		}
 	}
 
 	return nil
@@ -253,7 +373,7 @@ func (module *KafkaClient) processConsumerOffsetsMessage(msg *sarama.ConsumerMes
 
 	switch keyver {
 	case 0, 1:
-		module.decodeKeyAndOffset(keyBuffer, msg.Value, logger)
+		module.decodeKeyAndOffset(msg.Offset, keyBuffer, msg.Value, logger)
 	case 2:
 		module.decodeGroupMetadata(keyBuffer, msg.Value, logger)
 	default:
@@ -264,7 +384,7 @@ func (module *KafkaClient) processConsumerOffsetsMessage(msg *sarama.ConsumerMes
 	}
 }
 
-func readString(buf *bytes.Buffer) (string, error) {
+func readString(buf *bytes.Buffer) (string, error) { // nolint:interfacer
 	var strlen int16
 	err := binary.Read(buf, binary.BigEndian, &strlen)
 	if err != nil {
@@ -283,7 +403,6 @@ func readString(buf *bytes.Buffer) (string, error) {
 }
 
 func (module *KafkaClient) acceptConsumerGroup(group string) bool {
-	// No whitelist means everything passes
 	if (module.groupWhitelist != nil) && (!module.groupWhitelist.MatchString(group)) {
 		return false
 	}
@@ -293,7 +412,7 @@ func (module *KafkaClient) acceptConsumerGroup(group string) bool {
 	return true
 }
 
-func (module *KafkaClient) decodeKeyAndOffset(keyBuffer *bytes.Buffer, value []byte, logger *zap.Logger) {
+func (module *KafkaClient) decodeKeyAndOffset(offsetOrder int64, keyBuffer *bytes.Buffer, value []byte, logger *zap.Logger) {
 	// Version 0 and 1 keys are decoded the same way
 	offsetKey, errorAt := decodeOffsetKeyV0(keyBuffer)
 	if errorAt != "" {
@@ -331,7 +450,9 @@ func (module *KafkaClient) decodeKeyAndOffset(keyBuffer *bytes.Buffer, value []b
 
 	switch valueVersion {
 	case 0, 1:
-		module.decodeAndSendOffset(offsetKey, valueBuffer, offsetLogger)
+		module.decodeAndSendOffset(offsetOrder, offsetKey, valueBuffer, offsetLogger, decodeOffsetValueV0)
+	case 3:
+		module.decodeAndSendOffset(offsetOrder, offsetKey, valueBuffer, offsetLogger, decodeOffsetValueV3)
 	default:
 		offsetLogger.Warn("failed to decode",
 			zap.String("reason", "value version"),
@@ -340,8 +461,8 @@ func (module *KafkaClient) decodeKeyAndOffset(keyBuffer *bytes.Buffer, value []b
 	}
 }
 
-func (module *KafkaClient) decodeAndSendOffset(offsetKey offsetKey, valueBuffer *bytes.Buffer, logger *zap.Logger) {
-	offsetValue, errorAt := decodeOffsetValueV0(valueBuffer)
+func (module *KafkaClient) decodeAndSendOffset(offsetOrder int64, offsetKey offsetKey, valueBuffer *bytes.Buffer, logger *zap.Logger, decoder func(*bytes.Buffer) (offsetValue, string)) {
+	offsetValue, errorAt := decoder(valueBuffer)
 	if errorAt != "" {
 		logger.Warn("failed to decode",
 			zap.Int64("offset", offsetValue.Offset),
@@ -355,10 +476,11 @@ func (module *KafkaClient) decodeAndSendOffset(offsetKey offsetKey, valueBuffer 
 		RequestType: protocol.StorageSetConsumerOffset,
 		Cluster:     module.cluster,
 		Topic:       offsetKey.Topic,
-		Partition:   int32(offsetKey.Partition),
+		Partition:   offsetKey.Partition,
 		Group:       offsetKey.Group,
-		Timestamp:   int64(offsetValue.Timestamp),
-		Offset:      int64(offsetValue.Offset),
+		Timestamp:   offsetValue.Timestamp,
+		Offset:      offsetValue.Offset,
+		Order:       offsetOrder,
 	}
 	logger.Debug("consumer offset",
 		zap.Int64("offset", offsetValue.Offset),
@@ -390,7 +512,7 @@ func (module *KafkaClient) decodeGroupMetadata(keyBuffer *bytes.Buffer, value []
 	}
 
 	switch valueVersion {
-	case 0, 1:
+	case 0, 1, 2, 3:
 		module.decodeAndSendGroupMetadata(valueVersion, group, valueBuffer, logger.With(
 			zap.String("message_type", "metadata"),
 			zap.String("group", group),
@@ -406,17 +528,30 @@ func (module *KafkaClient) decodeGroupMetadata(keyBuffer *bytes.Buffer, value []
 }
 
 func (module *KafkaClient) decodeAndSendGroupMetadata(valueVersion int16, group string, valueBuffer *bytes.Buffer, logger *zap.Logger) {
-	metadataHeader, errorAt := decodeMetadataValueHeader(valueBuffer)
+	var metadataHeader metadataHeader
+	var errorAt string
+	switch valueVersion {
+	case 2, 3:
+		metadataHeader, errorAt = decodeMetadataValueHeaderV2(valueBuffer)
+	default:
+		metadataHeader, errorAt = decodeMetadataValueHeader(valueBuffer)
+	}
 	metadataLogger := logger.With(
 		zap.String("protocol_type", metadataHeader.ProtocolType),
 		zap.Int32("generation", metadataHeader.Generation),
 		zap.String("protocol", metadataHeader.Protocol),
 		zap.String("leader", metadataHeader.Leader),
+		zap.Int64("current_state_timestamp", metadataHeader.CurrentStateTimestamp),
 	)
 	if errorAt != "" {
 		metadataLogger.Warn("failed to decode",
 			zap.String("reason", errorAt),
 		)
+		return
+	}
+	metadataLogger.Debug("group metadata")
+	if metadataHeader.ProtocolType != "consumer" {
+		metadataLogger.Debug("skipped metadata because of unknown protocolType")
 		return
 	}
 
@@ -450,7 +585,6 @@ func (module *KafkaClient) decodeAndSendGroupMetadata(valueVersion int16, group 
 			return
 		}
 
-		metadataLogger.Debug("group metadata")
 		for topic, partitions := range member.Assignment {
 			for _, partition := range partitions {
 				helpers.TimeoutSendStorageRequest(module.App.StorageChannel, &protocol.StorageRequest{
@@ -460,6 +594,7 @@ func (module *KafkaClient) decodeAndSendGroupMetadata(valueVersion int16, group 
 					Partition:   partition,
 					Group:       group,
 					Owner:       member.ClientHost,
+					ClientID:    member.ClientID,
 				}, 1)
 			}
 		}
@@ -489,6 +624,40 @@ func decodeMetadataValueHeader(buf *bytes.Buffer) (metadataHeader, string) {
 	return metadataHeader, ""
 }
 
+func decodeMetadataValueHeaderV2(buf *bytes.Buffer) (metadataHeader, string) {
+	var err error
+	metadataHeader := metadataHeader{}
+
+	metadataHeader.ProtocolType, err = readString(buf)
+	if err != nil {
+		return metadataHeader, "protocol_type"
+	}
+	err = binary.Read(buf, binary.BigEndian, &metadataHeader.Generation)
+	if err != nil {
+		return metadataHeader, "generation"
+	}
+	metadataHeader.Protocol, err = readString(buf)
+	if err != nil {
+		return metadataHeader, "protocol"
+	}
+	metadataHeader.Leader, err = readString(buf)
+	if err != nil {
+		return metadataHeader, "leader"
+	}
+	err = binary.Read(buf, binary.BigEndian, &metadataHeader.CurrentStateTimestamp)
+	if err != nil {
+		return metadataHeader, "current_state_timestamp"
+	}
+	return metadataHeader, ""
+}
+
+func decodeGroupInstanceID(buf *bytes.Buffer, memberVersion int16) (string, error) {
+	if memberVersion == 3 {
+		return readString(buf)
+	}
+	return "", nil
+}
+
 func decodeMetadataMember(buf *bytes.Buffer, memberVersion int16) (metadataMember, string) {
 	var err error
 	memberMetadata := metadataMember{}
@@ -496,6 +665,10 @@ func decodeMetadataMember(buf *bytes.Buffer, memberVersion int16) (metadataMembe
 	memberMetadata.MemberID, err = readString(buf)
 	if err != nil {
 		return memberMetadata, "member_id"
+	}
+	memberMetadata.GroupInstanceID, err = decodeGroupInstanceID(buf, memberVersion)
+	if err != nil {
+		return memberMetadata, "group_instance_id"
 	}
 	memberMetadata.ClientID, err = readString(buf)
 	if err != nil {
@@ -505,7 +678,7 @@ func decodeMetadataMember(buf *bytes.Buffer, memberVersion int16) (metadataMembe
 	if err != nil {
 		return memberMetadata, "client_host"
 	}
-	if memberVersion == 1 {
+	if memberVersion >= 1 {
 		err = binary.Read(buf, binary.BigEndian, &memberMetadata.RebalanceTimeout)
 		if err != nil {
 			return memberMetadata, "rebalance_timeout"
@@ -581,7 +754,7 @@ func decodeMemberAssignmentV0(buf *bytes.Buffer) (map[string][]int32, string) {
 			if err != nil {
 				return topics, "assignment_partition_id"
 			}
-			topics[topicName][j] = int32(partitionID)
+			topics[topicName][j] = partitionID
 		}
 	}
 
@@ -622,6 +795,30 @@ func decodeOffsetValueV0(valueBuffer *bytes.Buffer) (offsetValue, string) {
 	err = binary.Read(valueBuffer, binary.BigEndian, &offsetValue.Offset)
 	if err != nil {
 		return offsetValue, "offset"
+	}
+	_, err = readString(valueBuffer)
+	if err != nil {
+		return offsetValue, "metadata"
+	}
+	err = binary.Read(valueBuffer, binary.BigEndian, &offsetValue.Timestamp)
+	if err != nil {
+		return offsetValue, "timestamp"
+	}
+	return offsetValue, ""
+}
+
+func decodeOffsetValueV3(valueBuffer *bytes.Buffer) (offsetValue, string) {
+	var err error
+	offsetValue := offsetValue{}
+
+	err = binary.Read(valueBuffer, binary.BigEndian, &offsetValue.Offset)
+	if err != nil {
+		return offsetValue, "offset"
+	}
+	var leaderEpoch int32
+	err = binary.Read(valueBuffer, binary.BigEndian, &leaderEpoch)
+	if err != nil {
+		return offsetValue, "leaderEpoch"
 	}
 	_, err = readString(valueBuffer)
 	if err != nil {

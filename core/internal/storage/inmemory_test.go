@@ -15,16 +15,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/stretchr/testify/assert"
 	"testing"
 
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 
+	"github.com/stretchr/testify/assert"
+
 	"github.com/linkedin/Burrow/core/protocol"
 )
 
-func fixtureModule(whitelist string) *InMemoryStorage {
+func fixtureModule(whitelist, blacklist string) *InMemoryStorage {
 	module := InMemoryStorage{
 		Log: zap.NewNop(),
 	}
@@ -34,14 +35,19 @@ func fixtureModule(whitelist string) *InMemoryStorage {
 
 	viper.Reset()
 	viper.Set("storage.test.class-name", "inmemory")
-	viper.Set("storage.test.group-whitelist", whitelist)
+	if whitelist != "" {
+		viper.Set("storage.test.group-whitelist", whitelist)
+	}
+	if blacklist != "" {
+		viper.Set("storage.test.group-blacklist", blacklist)
+	}
 	viper.Set("storage.test.min-distance", 1)
 
 	return &module
 }
 
 func startWithTestCluster(whitelist string) *InMemoryStorage {
-	module := fixtureModule(whitelist)
+	module := fixtureModule(whitelist, "")
 
 	// Start needs at least one cluster defined, but it only needs to have a name here
 	viper.Set("cluster.testcluster.class-name", "kafka")
@@ -79,6 +85,7 @@ func startWithTestConsumerOffsets(whitelist string, startTime int64) *InMemorySt
 	}
 	for i := 0; i < 10; i++ {
 		request.Offset = int64(1000 + (i * 100))
+		request.Order = int64(500 + i)
 		request.Timestamp = startTime + int64(i*10000)
 		module.addConsumerOffset(&request, module.Log)
 	}
@@ -94,19 +101,26 @@ func TestInMemoryStorage_ImplementsStorageModule(t *testing.T) {
 }
 
 func TestInMemoryStorage_Configure(t *testing.T) {
-	module := fixtureModule("")
+	module := fixtureModule("", "")
 	module.Configure("test", "storage.test")
 }
 
 func TestInMemoryStorage_Configure_DefaultIntervals(t *testing.T) {
-	module := fixtureModule("")
+	module := fixtureModule("", "")
 	module.Configure("test", "storage.test")
 	assert.Equal(t, 10, module.intervals, "Default Intervals value of 10 did not get set")
 }
 
-func TestInMemoryStorage_Configure_BadRegexp(t *testing.T) {
-	module := fixtureModule("")
+func TestInMemoryStorage_Configure_BadWhitelistRegexp(t *testing.T) {
+	module := fixtureModule("", "")
 	viper.Set("storage.test.group-whitelist", "[")
+
+	assert.Panics(t, func() { module.Configure("test", "storage.test") }, "The code did not panic")
+}
+
+func TestInMemoryStorage_Configure_BadBlacklistRegexp(t *testing.T) {
+	module := fixtureModule("", "")
+	viper.Set("storage.test.group-blacklist", "[")
 
 	assert.Panics(t, func() { module.Configure("test", "storage.test") }, "The code did not panic")
 }
@@ -215,8 +229,8 @@ func TestInMemoryStorage_addBrokerOffset_AddMany(t *testing.T) {
 		Timestamp:           9876,
 	}
 	for i := 0; i < 100; i++ {
-		request.Offset = request.Offset + 1
-		request.Timestamp = request.Timestamp + 1
+		request.Offset++
+		request.Timestamp++
 		module.addBrokerOffset(&request, module.Log)
 	}
 
@@ -290,8 +304,9 @@ func TestInMemoryStorage_getBrokerOffset(t *testing.T) {
 }
 
 func TestInMemoryStorage_addConsumerOffset(t *testing.T) {
-	startTime := (time.Now().Unix() * 1000) - 100000
-	module := startWithTestConsumerOffsets("", startTime)
+	startTime := (time.Now().Unix() * 1000)
+	timestampBase := startTime - 100000
+	module := startWithTestConsumerOffsets("", timestampBase)
 
 	request := protocol.StorageRequest{
 		RequestType: protocol.StorageSetConsumerOffset,
@@ -300,9 +315,11 @@ func TestInMemoryStorage_addConsumerOffset(t *testing.T) {
 		Group:       "testgroup",
 		Partition:   0,
 		Offset:      2000,
-		Timestamp:   startTime + 100000,
+		Order:       1000,
+		Timestamp:   timestampBase + 100000,
 	}
 	module.addConsumerOffset(&request, module.Log)
+	completeTime := time.Now().Unix() * 1000
 
 	consumerMap, ok := module.offsets["testcluster"].consumer["testgroup"]
 	assert.True(t, ok, "Group not created")
@@ -311,6 +328,7 @@ func TestInMemoryStorage_addConsumerOffset(t *testing.T) {
 	assert.Len(t, partitions, 1, "One partition not created")
 	assert.Equal(t, 10, partitions[0].offsets.Len(), "10 offset ring entries not created")
 	assert.Equal(t, "", partitions[0].owner, "Expected owner to be empty")
+	assert.Equal(t, "", partitions[0].clientID, "Expected clientID to be empty")
 
 	// All the ring values should be not nil
 	r := partitions[0].offsets
@@ -320,12 +338,14 @@ func TestInMemoryStorage_addConsumerOffset(t *testing.T) {
 
 		offset := r.Value.(*protocol.ConsumerOffset)
 		offsetValue := int64(1100 + (i * 100))
-		timestampValue := startTime + 10000 + int64(i*10000)
+		timestampValue := timestampBase + 10000 + int64(i*10000)
 		lagValue := uint64(int64(4321) - offsetValue)
 
 		assert.Equalf(t, offsetValue, offset.Offset, "Expected offset at position %v to be %v, got %v", i, offsetValue, offset.Offset)
 		assert.Equalf(t, timestampValue, offset.Timestamp, "Expected timestamp at position %v to be %v, got %v", i, timestampValue, offset.Timestamp)
-		assert.Equalf(t, lagValue, offset.Lag, "Expected lag at position %v to be %v, got %v", i, lagValue, offset.Lag)
+		assert.LessOrEqual(t, startTime, offset.ObservedTimestamp, "Expected observedTimestamp at position %v to be <= %v, got %v", i, completeTime, offset.ObservedTimestamp)
+		assert.GreaterOrEqual(t, completeTime, offset.ObservedTimestamp, "Expected observedTimestamp at position %v to be >= %v, got %v", i, startTime, offset.ObservedTimestamp)
+		assert.Equalf(t, &protocol.Lag{Value: lagValue}, offset.Lag, "Expected lag at position %v to be %v, got %v", i, lagValue, offset.Lag)
 
 		r = r.Next()
 	}
@@ -348,29 +368,298 @@ func TestInMemoryStorage_addConsumerOffset_TooOld(t *testing.T) {
 	assert.False(t, ok, "Group testgroup created when offsets are too old")
 }
 
-type testset struct {
-	whitelist  string
-	passGroups []string
-	failGroups []string
+// helpers for addConsumerOffset* tests
+func getPartitionOffsets(module *InMemoryStorage) []*protocol.ConsumerOffset {
+	request := protocol.StorageRequest{
+		RequestType: protocol.StorageFetchConsumer,
+		Cluster:     "testcluster",
+		Group:       "testgroup",
+		Reply:       make(chan interface{}),
+	}
+
+	go module.fetchConsumer(&request, module.Log)
+	response := <-request.Reply
+	partition := response.(protocol.ConsumerTopics)["testtopic"][0]
+
+	var ret []*protocol.ConsumerOffset
+	for _, x := range partition.Offsets {
+		if x != nil {
+			ret = append(ret, x)
+		}
+	}
+
+	return ret
 }
 
-var whitelistTests = []testset{
-	{"", []string{"testgroup", "ok_group", "dash-group", "num02group"}, []string{}},
+type consumerOffsetTest struct {
+	partitionOffset int64
+	inputs          []*protocol.ConsumerOffset
+	outputs         []*protocol.ConsumerOffset
+}
+
+// This section tests edge cases of inserting / appending various consumer offsets.
+//
+// When adding tests, remember the following things:
+//     1) All timestamp fields will have "now" added to make them recent enough to not be dropped
+//     2) Tests should be commented with the index number, as well as what they are trying to test and why the expected results are correct
+//     3) If you change an existing test, there needs to be a good explanation as to why along with the PR
+var consumerOffsetTests = []consumerOffsetTest{
+	// 0 - appending multiple offsets
+	{
+		partitionOffset: 5000,
+		inputs: []*protocol.ConsumerOffset{
+			{Offset: 1000, Order: 1, Timestamp: 100000, Lag: nil},
+			{Offset: 2000, Order: 2, Timestamp: 200000, Lag: nil},
+			{Offset: 3000, Order: 3, Timestamp: 300000, Lag: nil},
+			{Offset: 4000, Order: 4, Timestamp: 400000, Lag: nil},
+			{Offset: 5000, Order: 5, Timestamp: 500000, Lag: nil},
+		},
+		outputs: []*protocol.ConsumerOffset{
+			{Offset: 1000, Order: 1, Timestamp: 100000, Lag: &protocol.Lag{Value: 4000}},
+			{Offset: 2000, Order: 2, Timestamp: 200000, Lag: &protocol.Lag{Value: 3000}},
+			{Offset: 3000, Order: 3, Timestamp: 300000, Lag: &protocol.Lag{Value: 2000}},
+			{Offset: 4000, Order: 4, Timestamp: 400000, Lag: &protocol.Lag{Value: 1000}},
+			{Offset: 5000, Order: 5, Timestamp: 500000, Lag: &protocol.Lag{Value: 0}},
+		},
+	},
+
+	// 1 - prepending offsets until the buffer is full
+	{
+		partitionOffset: 5000,
+		inputs: []*protocol.ConsumerOffset{
+			{Offset: 1000, Order: 20, Timestamp: 100000, Lag: nil},
+			{Offset: 2000, Order: 30, Timestamp: 200000, Lag: nil},
+			// These will be prepended, based on their Order
+			{Offset: 3000, Order: 15, Timestamp: 300000, Lag: nil},
+			{Offset: 900, Order: 14, Timestamp: 300000, Lag: nil},
+			{Offset: 800, Order: 13, Timestamp: 300000, Lag: nil},
+			{Offset: 700, Order: 12, Timestamp: 300000, Lag: nil},
+			{Offset: 600, Order: 11, Timestamp: 300000, Lag: nil},
+			{Offset: 500, Order: 10, Timestamp: 300000, Lag: nil},
+			{Offset: 400, Order: 9, Timestamp: 300000, Lag: nil},
+			{Offset: 300, Order: 8, Timestamp: 300000, Lag: nil},
+			// these will get dropped because their Order is oldest
+			{Offset: 200, Order: 7, Timestamp: 300000, Lag: nil},
+			{Offset: 100, Order: 6, Timestamp: 300000, Lag: nil},
+		},
+		outputs: []*protocol.ConsumerOffset{
+			{Offset: 300, Order: 8, Timestamp: 300000, Lag: nil},
+			{Offset: 400, Order: 9, Timestamp: 300000, Lag: nil},
+			{Offset: 500, Order: 10, Timestamp: 300000, Lag: nil},
+			{Offset: 600, Order: 11, Timestamp: 300000, Lag: nil},
+			{Offset: 700, Order: 12, Timestamp: 300000, Lag: nil},
+			{Offset: 800, Order: 13, Timestamp: 300000, Lag: nil},
+			{Offset: 900, Order: 14, Timestamp: 300000, Lag: nil},
+			{Offset: 3000, Order: 15, Timestamp: 300000, Lag: nil},
+			{Offset: 1000, Order: 20, Timestamp: 100000, Lag: &protocol.Lag{Value: 4000}},
+			{Offset: 2000, Order: 30, Timestamp: 200000, Lag: &protocol.Lag{Value: 3000}},
+		},
+	},
+
+	// 2 - inserting offsets between existing entries
+	{
+		partitionOffset: 5000,
+		inputs: []*protocol.ConsumerOffset{
+			{Offset: 1000, Order: 20, Timestamp: 100000, Lag: nil},
+			{Offset: 2000, Order: 30, Timestamp: 300000, Lag: nil},
+			{Offset: 3000, Order: 40, Timestamp: 400000, Lag: nil},
+			{Offset: 1500, Order: 25, Timestamp: 200000, Lag: nil},
+		},
+		outputs: []*protocol.ConsumerOffset{
+			{Offset: 1000, Order: 20, Timestamp: 100000, Lag: &protocol.Lag{Value: 4000}},
+			{Offset: 1500, Order: 25, Timestamp: 200000, Lag: nil},
+			{Offset: 2000, Order: 30, Timestamp: 300000, Lag: &protocol.Lag{Value: 3000}},
+			{Offset: 3000, Order: 40, Timestamp: 400000, Lag: &protocol.Lag{Value: 2000}},
+		},
+	},
+
+	// 3 - inserting an offset when the ring is full
+	{
+		partitionOffset: 10000,
+		inputs: []*protocol.ConsumerOffset{
+			{Offset: 1000, Order: 10, Timestamp: 100000, Lag: nil},
+			{Offset: 2000, Order: 20, Timestamp: 200000, Lag: nil},
+			{Offset: 3000, Order: 30, Timestamp: 300000, Lag: nil},
+			{Offset: 4000, Order: 40, Timestamp: 400000, Lag: nil},
+			{Offset: 5000, Order: 50, Timestamp: 500000, Lag: nil},
+			{Offset: 6000, Order: 60, Timestamp: 600000, Lag: nil},
+			{Offset: 7000, Order: 70, Timestamp: 700000, Lag: nil},
+			{Offset: 8000, Order: 80, Timestamp: 800000, Lag: nil},
+			{Offset: 9000, Order: 90, Timestamp: 900000, Lag: nil},
+			{Offset: 10000, Order: 100, Timestamp: 1000000, Lag: nil},
+			// inserted between 50 & 60
+			{Offset: 5500, Order: 55, Timestamp: 550000, Lag: nil},
+		},
+		outputs: []*protocol.ConsumerOffset{
+			{Offset: 2000, Order: 20, Timestamp: 200000, Lag: &protocol.Lag{Value: 8000}},
+			{Offset: 3000, Order: 30, Timestamp: 300000, Lag: &protocol.Lag{Value: 7000}},
+			{Offset: 4000, Order: 40, Timestamp: 400000, Lag: &protocol.Lag{Value: 6000}},
+			{Offset: 5000, Order: 50, Timestamp: 500000, Lag: &protocol.Lag{Value: 5000}},
+			{Offset: 5500, Order: 55, Timestamp: 550000, Lag: nil},
+			{Offset: 6000, Order: 60, Timestamp: 600000, Lag: &protocol.Lag{Value: 4000}},
+			{Offset: 7000, Order: 70, Timestamp: 700000, Lag: &protocol.Lag{Value: 3000}},
+			{Offset: 8000, Order: 80, Timestamp: 800000, Lag: &protocol.Lag{Value: 2000}},
+			{Offset: 9000, Order: 90, Timestamp: 900000, Lag: &protocol.Lag{Value: 1000}},
+			{Offset: 10000, Order: 100, Timestamp: 1000000, Lag: &protocol.Lag{Value: 0}},
+		},
+	},
+
+	// 4 - replacing the oldest offset when the ring is full
+	{
+		partitionOffset: 10000,
+		inputs: []*protocol.ConsumerOffset{
+			{Offset: 1000, Order: 10, Timestamp: 100000, Lag: nil},
+			{Offset: 2000, Order: 20, Timestamp: 200000, Lag: nil},
+			{Offset: 3000, Order: 30, Timestamp: 300000, Lag: nil},
+			{Offset: 4000, Order: 40, Timestamp: 400000, Lag: nil},
+			{Offset: 5000, Order: 50, Timestamp: 500000, Lag: nil},
+			{Offset: 6000, Order: 60, Timestamp: 600000, Lag: nil},
+			{Offset: 7000, Order: 70, Timestamp: 700000, Lag: nil},
+			{Offset: 8000, Order: 80, Timestamp: 800000, Lag: nil},
+			{Offset: 9000, Order: 90, Timestamp: 900000, Lag: nil},
+			{Offset: 10000, Order: 100, Timestamp: 1000000, Lag: nil},
+			{Offset: 1500, Order: 15, Timestamp: 150000, Lag: nil},
+		},
+		outputs: []*protocol.ConsumerOffset{
+			{Offset: 1500, Order: 15, Timestamp: 150000, Lag: nil},
+			{Offset: 2000, Order: 20, Timestamp: 200000, Lag: &protocol.Lag{Value: 8000}},
+			{Offset: 3000, Order: 30, Timestamp: 300000, Lag: &protocol.Lag{Value: 7000}},
+			{Offset: 4000, Order: 40, Timestamp: 400000, Lag: &protocol.Lag{Value: 6000}},
+			{Offset: 5000, Order: 50, Timestamp: 500000, Lag: &protocol.Lag{Value: 5000}},
+			{Offset: 6000, Order: 60, Timestamp: 600000, Lag: &protocol.Lag{Value: 4000}},
+			{Offset: 7000, Order: 70, Timestamp: 700000, Lag: &protocol.Lag{Value: 3000}},
+			{Offset: 8000, Order: 80, Timestamp: 800000, Lag: &protocol.Lag{Value: 2000}},
+			{Offset: 9000, Order: 90, Timestamp: 900000, Lag: &protocol.Lag{Value: 1000}},
+			{Offset: 10000, Order: 100, Timestamp: 1000000, Lag: &protocol.Lag{Value: 0}},
+		},
+	},
+
+	// 5 - replacing the most recent offset (frequent commit)
+	{
+		partitionOffset: 10000,
+		inputs: []*protocol.ConsumerOffset{
+			{Offset: 1000, Order: 10, Timestamp: 100000, Lag: nil},
+			{Offset: 2000, Order: 20, Timestamp: 200000, Lag: nil},
+			{Offset: 3000, Order: 30, Timestamp: 300000, Lag: nil},
+			{Offset: 4000, Order: 40, Timestamp: 400000, Lag: nil},
+			{Offset: 5000, Order: 50, Timestamp: 500000, Lag: nil},
+			{Offset: 6000, Order: 60, Timestamp: 500001, Lag: nil},
+		},
+		outputs: []*protocol.ConsumerOffset{
+			{Offset: 1000, Order: 10, Timestamp: 100000, Lag: &protocol.Lag{Value: 9000}},
+			{Offset: 2000, Order: 20, Timestamp: 200000, Lag: &protocol.Lag{Value: 8000}},
+			{Offset: 3000, Order: 30, Timestamp: 300000, Lag: &protocol.Lag{Value: 7000}},
+			{Offset: 4000, Order: 40, Timestamp: 400000, Lag: &protocol.Lag{Value: 6000}},
+			{Offset: 6000, Order: 60, Timestamp: 500000, Lag: &protocol.Lag{Value: 4000}},
+		},
+	},
+
+	// 6 - replacing a previous offset (frequent commit)
+	{
+		partitionOffset: 10000,
+		inputs: []*protocol.ConsumerOffset{
+			{Offset: 1000, Order: 10, Timestamp: 100000, Lag: nil},
+			{Offset: 2000, Order: 20, Timestamp: 200000, Lag: nil},
+			{Offset: 3000, Order: 30, Timestamp: 300000, Lag: nil},
+			{Offset: 4000, Order: 40, Timestamp: 400000, Lag: nil},
+			{Offset: 5000, Order: 50, Timestamp: 500000, Lag: nil},
+			{Offset: 4500, Order: 45, Timestamp: 400001, Lag: nil},
+		},
+		outputs: []*protocol.ConsumerOffset{
+			{Offset: 1000, Order: 10, Timestamp: 100000, Lag: &protocol.Lag{Value: 9000}},
+			{Offset: 2000, Order: 20, Timestamp: 200000, Lag: &protocol.Lag{Value: 8000}},
+			{Offset: 3000, Order: 30, Timestamp: 300000, Lag: &protocol.Lag{Value: 7000}},
+			{Offset: 4500, Order: 45, Timestamp: 400000, Lag: nil},
+			{Offset: 5000, Order: 50, Timestamp: 500000, Lag: &protocol.Lag{Value: 5000}},
+		},
+	},
+}
+
+func TestInMemoryStorage_addConsumerOffset_testCases(t *testing.T) {
+	startTime := (time.Now().Unix() * 1000) - 100000
+
+	for i, testSet := range consumerOffsetTests {
+		module := startWithTestCluster("")
+		request := protocol.StorageRequest{
+			RequestType:         protocol.StorageSetBrokerOffset,
+			Cluster:             "testcluster",
+			Topic:               "testtopic",
+			Partition:           0,
+			TopicPartitionCount: 1,
+			Offset:              testSet.partitionOffset,
+			Timestamp:           startTime,
+		}
+		module.addBrokerOffset(&request, module.Log)
+
+		for _, input := range testSet.inputs {
+			request := protocol.StorageRequest{
+				RequestType: protocol.StorageSetConsumerOffset,
+				Cluster:     "testcluster",
+				Topic:       "testtopic",
+				Group:       "testgroup",
+				Partition:   0,
+				Offset:      input.Offset,
+				Order:       input.Order,
+				Timestamp:   startTime + input.Timestamp,
+			}
+			module.addConsumerOffset(&request, module.Log)
+		}
+
+		offsets := getPartitionOffsets(module)
+		for _, offset := range testSet.outputs {
+			// adjust timestamp to be based on `startTime`
+			offset.Timestamp += startTime
+		}
+		assert.Len(t, offsets, len(testSet.outputs), "TEST %v: number of stored offsets", i)
+		for offsetIndex, expected := range testSet.outputs {
+			// don't include clock time in comparisons
+			offsets[offsetIndex].ObservedTimestamp = 0
+			assert.Equal(t, expected, offsets[offsetIndex], "TEST %v offset %v", i, offsetIndex)
+		}
+	}
+}
+
+type testset struct {
+	regexFilter   string
+	matchGroups   []string
+	noMatchGroups []string
+}
+
+var regexFilterTests = []testset{
+	{".*", []string{"testgroup", "ok_group", "dash-group", "num02group"}, []string{}},
 	{"test.*", []string{"testgroup"}, []string{"ok_group", "dash-group", "num02group"}},
 	{".*[0-9]+.*", []string{"num02group"}, []string{"ok_group", "dash-group", "testgroup"}},
 	{"onlygroup", []string{"onlygroup"}, []string{"testgroup", "ok_group", "dash-group", "num02group"}},
 }
 
 func TestInMemoryStorage_acceptConsumerGroup_NoWhitelist(t *testing.T) {
-	for i, testSet := range whitelistTests {
-		module := fixtureModule(testSet.whitelist)
+	for i, testSet := range regexFilterTests {
+		module := fixtureModule(testSet.regexFilter, "")
 		module.Configure("test", "storage.test")
 
-		for _, group := range testSet.passGroups {
+		for _, group := range testSet.matchGroups {
 			result := module.acceptConsumerGroup(group)
 			assert.Truef(t, result, "TEST %v: Expected group %v to pass", i, group)
 		}
-		for _, group := range testSet.failGroups {
+		for _, group := range testSet.noMatchGroups {
+			result := module.acceptConsumerGroup(group)
+			assert.Falsef(t, result, "TEST %v: Expected group %v to fail", i, group)
+		}
+	}
+}
+
+func TestInMemoryStorage_acceptConsumerGroup_Blacklist(t *testing.T) {
+	// just taking the inverse of TestInMemoryStorage_acceptConsumerGroup_NoWhitelist
+	// so noMatchGroups will return true and matchGroup entries will be false.
+	for i, testSet := range regexFilterTests {
+		module := fixtureModule("", testSet.regexFilter)
+		module.Configure("test", "storage.test")
+
+		for _, group := range testSet.noMatchGroups {
+			result := module.acceptConsumerGroup(group)
+			assert.Truef(t, result, "TEST %v: Expected group %v to pass", i, group)
+		}
+		for _, group := range testSet.matchGroups {
 			result := module.acceptConsumerGroup(group)
 			assert.Falsef(t, result, "TEST %v: Expected group %v to fail", i, group)
 		}
@@ -389,6 +678,7 @@ func TestInMemoryStorage_addConsumerOffset_MinDistance(t *testing.T) {
 		Group:       "testgroup",
 		Partition:   0,
 		Offset:      2000,
+		Order:       1000,
 		Timestamp:   startTime + 90001,
 	}
 	module.addConsumerOffset(&request, module.Log)
@@ -417,7 +707,7 @@ func TestInMemoryStorage_addConsumerOffset_MinDistance(t *testing.T) {
 
 		assert.Equalf(t, offsetValue, offset.Offset, "Expected offset at position %v to be %v, got %v", i, offsetValue, offset.Offset)
 		assert.Equalf(t, timestampValue, offset.Timestamp, "Expected timestamp at position %v to be %v, got %v", i, timestampValue, offset.Timestamp)
-		assert.Equalf(t, lagValue, offset.Lag, "Expected lag at position %v to be %v, got %v", i, lagValue, offset.Lag)
+		assert.Equalf(t, &protocol.Lag{Value: lagValue}, offset.Lag, "Expected lag at position %v to be %v, got %v", i, lagValue, offset.Lag)
 
 		r = r.Next()
 	}
@@ -472,6 +762,7 @@ func TestInMemoryStorage_addConsumerOwner(t *testing.T) {
 		Group:       "testgroup",
 		Partition:   0,
 		Owner:       "testhost.example.com",
+		ClientID:    "test_client_id",
 	}
 	module.addConsumerOwner(&request, module.Log)
 
@@ -481,6 +772,7 @@ func TestInMemoryStorage_addConsumerOwner(t *testing.T) {
 	assert.True(t, ok, "Topic not created")
 	assert.Len(t, partitions, 1, "One partition not created")
 	assert.Equal(t, "testhost.example.com", partitions[0].owner, "Expected owner to be testhost.example.com, not %v", partitions[0].owner)
+	assert.Equal(t, "test_client_id", partitions[0].clientID, "Expected clientID to be test_client_id, not %v", partitions[0].clientID)
 }
 
 func TestInMemoryStorage_deleteTopic(t *testing.T) {
@@ -748,8 +1040,9 @@ func TestInMemoryStorage_fetchTopic_BadTopic(t *testing.T) {
 }
 
 func TestInMemoryStorage_fetchConsumer(t *testing.T) {
-	startTime := (time.Now().Unix() * 1000) - 100000
-	module := startWithTestConsumerOffsets("", startTime)
+	startTime := (time.Now().Unix() * 1000)
+	timestampBase := startTime - 100000
+	module := startWithTestConsumerOffsets("", timestampBase)
 
 	// Set the owner for the test partition
 	request := protocol.StorageRequest{
@@ -759,6 +1052,7 @@ func TestInMemoryStorage_fetchConsumer(t *testing.T) {
 		Group:       "testgroup",
 		Partition:   0,
 		Owner:       "testhost.example.com",
+		ClientID:    "test_client_id",
 	}
 	module.addConsumerOwner(&request, module.Log)
 
@@ -772,6 +1066,7 @@ func TestInMemoryStorage_fetchConsumer(t *testing.T) {
 	// Can't read a reply without concurrency
 	go module.fetchConsumer(&request, module.Log)
 	response := <-request.Reply
+	completeTime := time.Now().Unix() * 1000
 
 	assert.IsType(t, protocol.ConsumerTopics{}, response, "Expected response to be of type map[string][]*protocol.consumerPartition")
 	val := response.(protocol.ConsumerTopics)
@@ -781,6 +1076,7 @@ func TestInMemoryStorage_fetchConsumer(t *testing.T) {
 	assert.Len(t, val["testtopic"], 1, "One partition for topic not returned")
 	assert.Equalf(t, uint64(2421), val["testtopic"][0].CurrentLag, "Expected current lag to be 2421, not %v", val["testtopic"][0].CurrentLag)
 	assert.Equalf(t, "testhost.example.com", val["testtopic"][0].Owner, "Expected owner to be testhost.example.com, not %v", val["testtopic"][0].Owner)
+	assert.Equalf(t, "test_client_id", val["testtopic"][0].ClientID, "Expected client_id to be test_client_id, not %v", val["testtopic"][0].ClientID)
 
 	offsets := val["testtopic"][0].Offsets
 	assert.Lenf(t, offsets, 10, "Expected to get 10 offsets for the partition, not %v", len(offsets))
@@ -788,12 +1084,14 @@ func TestInMemoryStorage_fetchConsumer(t *testing.T) {
 		assert.NotNilf(t, offsets[0], "Expected offset to be NOT nil at position %v", i)
 
 		offsetValue := int64(1000 + (i * 100))
-		timestampValue := startTime + int64(i*10000)
+		timestampValue := timestampBase + int64(i*10000)
 		lagValue := uint64(int64(4321) - offsetValue)
 
 		assert.Equalf(t, offsetValue, offsets[i].Offset, "Expected offset at position %v to be %v, got %v", i, offsetValue, offsets[i].Offset)
 		assert.Equalf(t, timestampValue, offsets[i].Timestamp, "Expected timestamp at position %v to be %v, got %v", i, timestampValue, offsets[i].Timestamp)
-		assert.Equalf(t, lagValue, offsets[i].Lag, "Expected lag at position %v to be %v, got %v", i, lagValue, offsets[i].Lag)
+		assert.LessOrEqual(t, startTime, offsets[i].ObservedTimestamp, "Expected observed timestamp at position %v to be <= %v, got %v", i, completeTime, offsets[i].ObservedTimestamp)
+		assert.GreaterOrEqual(t, completeTime, offsets[i].ObservedTimestamp, "Expected observed timestamp at position %v to be <= %v, got %v", i, completeTime, offsets[i].ObservedTimestamp)
+		assert.Equalf(t, &protocol.Lag{Value: lagValue}, offsets[i].Lag, "Expected lag at position %v to be %v, got %v", i, lagValue, offsets[i].Lag)
 	}
 
 	_, ok = <-request.Reply
@@ -864,7 +1162,7 @@ func TestInMemoryStorage_fetchConsumer_Expired(t *testing.T) {
 		consumerPartitionRing.Value = &protocol.ConsumerOffset{
 			Offset:    int64(offset),
 			Timestamp: ts,
-			Lag:       4321 - offset,
+			Lag:       &protocol.Lag{Value: 4321 - offset},
 		}
 		consumerMap.lastCommit = ts
 		consumerMap.topics["testtopic"][0].offsets = consumerMap.topics["testtopic"][0].offsets.Next()
@@ -899,6 +1197,7 @@ func TestInMemoryStorage_fetchConsumersForTopic(t *testing.T) {
 		Group:       "testgroup",
 		Partition:   0,
 		Owner:       "testhost.example.com",
+		ClientID:    "test_client_id",
 	}
 	module.addConsumerOwner(&request, module.Log)
 
@@ -934,6 +1233,7 @@ func TestInMemoryStorage_fetchConsumersForTopic_MultipleConsumers(t *testing.T) 
 		Group:       "testgroup",
 		Partition:   0,
 		Owner:       "testhost.example.com",
+		ClientID:    "test_client_id",
 	}
 	module.addConsumerOwner(&request, module.Log)
 	request = protocol.StorageRequest{
@@ -943,6 +1243,7 @@ func TestInMemoryStorage_fetchConsumersForTopic_MultipleConsumers(t *testing.T) 
 		Group:       "testgroup2",
 		Partition:   0,
 		Owner:       "testhost.example.com",
+		ClientID:    "test_client_id",
 	}
 	module.addConsumerOwner(&request, module.Log)
 

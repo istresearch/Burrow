@@ -33,8 +33,9 @@ type CachingEvaluator struct {
 	// fields that are appropriate to identify this coordinator
 	Log *zap.Logger
 
-	name        string
-	expireCache int
+	name            string
+	expireCache     int
+	minimumComplete float32
 
 	RequestChannel chan *protocol.EvaluatorRequest
 	running        sync.WaitGroup
@@ -53,7 +54,7 @@ func (e *cacheError) Error() string {
 // Configure validates the configuration for the module, creates a channel to receive requests on, and sets up the
 // cache. If no expiration time for cache entries is set, a default value of 10 seconds is used. If there is any problem
 // starting the goswarm cache, this func panics.
-func (module *CachingEvaluator) Configure(name string, configRoot string) {
+func (module *CachingEvaluator) Configure(name, configRoot string) {
 	module.Log.Info("configuring")
 
 	module.name = name
@@ -63,6 +64,7 @@ func (module *CachingEvaluator) Configure(name string, configRoot string) {
 	// Set defaults for configs if needed
 	viper.SetDefault(configRoot+".expire-cache", 10)
 	module.expireCache = viper.GetInt(configRoot + ".expire-cache")
+	module.minimumComplete = float32(viper.GetFloat64(configRoot + ".minimum-complete"))
 	cacheExpire := time.Duration(module.expireCache) * time.Second
 
 	newCache, err := goswarm.NewSimple(&goswarm.Config{
@@ -168,7 +170,7 @@ func (module *CachingEvaluator) getConsumerStatus(request *protocol.EvaluatorReq
 
 func (module *CachingEvaluator) evaluateConsumerStatus(clusterAndConsumer string) (interface{}, error) {
 	// First off, we need to separate the cluster and consumer values from the string provided
-	parts := strings.Split(clusterAndConsumer, " ")
+	parts := strings.SplitN(clusterAndConsumer, " ", 2)
 	if len(parts) != 2 {
 		module.Log.Error("query with bad clusterAndConsumer", zap.String("arg", clusterAndConsumer))
 		return nil, &cacheError{StatusCode: 500, Reason: "bad request"}
@@ -221,10 +223,11 @@ func (module *CachingEvaluator) evaluateConsumerStatus(clusterAndConsumer string
 	completePartitions := 0
 	for topic, partitions := range topics {
 		for partitionID, partition := range partitions {
-			partitionStatus := evaluatePartitionStatus(partition)
+			partitionStatus := evaluatePartitionStatus(partition, module.minimumComplete)
 			partitionStatus.Topic = topic
 			partitionStatus.Partition = int32(partitionID)
 			partitionStatus.Owner = partition.Owner
+			partitionStatus.ClientID = partition.ClientID
 
 			if partitionStatus.Status > status.Status {
 				// If the partition status is greater than StatusError, we just mark it as StatusError
@@ -247,7 +250,11 @@ func (module *CachingEvaluator) evaluateConsumerStatus(clusterAndConsumer string
 	}
 
 	// Calculate completeness as a percentage of the number of partitions that are complete
-	status.Complete = float32(completePartitions) / float32(status.TotalPartitions)
+	if status.TotalPartitions > 0 {
+		status.Complete = float32(completePartitions) / float32(status.TotalPartitions)
+	} else {
+		status.Complete = 0
+	}
 
 	module.Log.Debug("evaluation result",
 		zap.String("cluster", cluster),
@@ -260,7 +267,7 @@ func (module *CachingEvaluator) evaluateConsumerStatus(clusterAndConsumer string
 	return status, nil
 }
 
-func evaluatePartitionStatus(partition *protocol.ConsumerPartition) *protocol.PartitionStatus {
+func evaluatePartitionStatus(partition *protocol.ConsumerPartition, minimumComplete float32) *protocol.PartitionStatus {
 	status := &protocol.PartitionStatus{
 		Status:     protocol.StatusOK,
 		CurrentLag: partition.CurrentLag,
@@ -295,7 +302,11 @@ func evaluatePartitionStatus(partition *protocol.ConsumerPartition) *protocol.Pa
 	status.Start = offsets[0]
 	status.End = offsets[len(offsets)-1]
 
-	status.Status = calculatePartitionStatus(offsets, partition.BrokerOffsets, partition.CurrentLag, time.Now().Unix())
+	// If the partition does not meet the completeness threshold, just return it as OK
+	if status.Complete >= minimumComplete {
+		status.Status = calculatePartitionStatus(offsets, partition.BrokerOffsets, partition.CurrentLag, time.Now().Unix())
+	}
+
 	return status
 }
 
@@ -330,7 +341,7 @@ func calculatePartitionStatus(offsets []*protocol.ConsumerOffset, brokerOffsets 
 // Rule 1 - If over the stored period, the lag is ever zero for the partition, the period is OK
 func isLagAlwaysNotZero(offsets []*protocol.ConsumerOffset) bool {
 	for _, offset := range offsets {
-		if offset.Lag == 0 {
+		if offset.Lag != nil && offset.Lag.Value == 0 {
 			return false
 		}
 	}
@@ -368,9 +379,14 @@ func checkIfOffsetsStalled(offsets []*protocol.ConsumerOffset) bool {
 
 // Rule 5 - If the consumer offsets are advancing, but the lag is not decreasing somewhere, it's a warning (consumer is slow)
 func checkIfLagNotDecreasing(offsets []*protocol.ConsumerOffset) bool {
-	for i := 1; i < len(offsets); i++ {
-		if offsets[i].Lag < offsets[i-1].Lag {
-			return false
+	var lastLag *protocol.Lag
+	for i := 0; i < len(offsets); i++ {
+		lag := offsets[i].Lag
+		if lag != nil {
+			if lastLag != nil && lag.Value < lastLag.Value {
+				return false
+			}
+			lastLag = lag
 		}
 	}
 	return true
